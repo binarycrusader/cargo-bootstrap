@@ -92,6 +92,7 @@ specifying it as the `--local-cargo` option to Cargo's `./configure` script.
 """
 
 import argparse
+import errno
 import cStringIO
 import hashlib
 import inspect
@@ -652,9 +653,14 @@ class Runner(object):
         else:
             dbg('%s %s' % (envstr, ' '.join(cmd)))
 
-        proc = subprocess.Popen(cmd, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                cwd=self._cwd)
+        try:
+            proc = subprocess.Popen(cmd, env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    cwd=self._cwd)
+        except:
+            for a in env:
+                print "%s %s=<%s>" % (type(env[a]), a, env[a])
+            raise
         out, err = proc.communicate()
 
         for lo in out.split('\n'):
@@ -724,7 +730,7 @@ class BuildScriptRunner(Runner):
                 cmd += ['-L', v]
             elif k == 'rustc-cfg':
                 cmd += ['--cfg', v]
-                env['CARGO_FEATURE_%s' % v.upper().replace('-', '_')] = 1
+                env['CARGO_FEATURE_%s' % v.upper().replace('-', '_')] = "1"
             else:
                 #dbg("env[%s] = %s" % (k, v));
                 denv[k] = v
@@ -763,12 +769,12 @@ class Crate(object):
     def __str__(self):
         return '%s-%s' % (self.name(), self.version())
 
-    def add_dep(self, crate, features):
+    def add_dep(self, crate, kind, features):
         if str(crate) in self._deps:
             return
 
         features = [str(x) for x in features]
-        self._deps[str(crate)] = { 'features': features }
+        self._deps[str(crate)] = { 'kind': kind, 'features': features }
         crate.add_ref(self)
 
     def add_ref(self, crate):
@@ -790,7 +796,7 @@ class Crate(object):
             dbg('Resolving dependencies for: %s' % str(self))
             for d in self._dep_info:
                 kind = d.get('kind', 'normal')
-                if kind not in ('normal', 'build'):
+                if kind not in ('normal', 'build', 'all'):
                     print ''
                     dbg('Skipping %s dep %s' % (kind, d['name']))
                     continue
@@ -829,6 +835,7 @@ class Crate(object):
                     cdir = d['path']
                     name, ver, ideps, build = crate_info_from_toml(cdir)
                     deps += ideps
+                    dcrate = None
 
                 if name not in BLACKLIST:
                     try:
@@ -840,7 +847,7 @@ class Crate(object):
                         if graph is not None:
                             print >> graph, '"%s" -> "%s";' % (str(self), str(dcrate))
 
-                    except:
+                    except Exception:
                         dcrate = None
 
                 # clean up the list of features that are enabled
@@ -861,6 +868,10 @@ class Crate(object):
                     # and any features they depend on recursively
                     def add_features(f):
                         if f in ftrs:
+                            if not ftrs[f]:
+                                features.append(f)
+                                return
+
                             for k in ftrs[f]:
                                 # guard against infinite recursion
                                 if not k in features:
@@ -872,41 +883,85 @@ class Crate(object):
                     features += [x for x in ftrs if (len(x) > 0) and (x in tftrs)]
 
                 if dcrate is not None:
-                    self.add_dep(dcrate, features)
+                    self.add_dep(dcrate, d['kind'], features)
 
         self._resolved = True
         CRATES[str(self)] = self
 
     @dbgCtx
-    def build(self, by, out_dir, features=[]):
+    def build(self, by, host_out_dir, target, target_out_dir, features=[]):
         extra_filename = '-' + str(self.version()).replace('.','_')
         output_name = self.name().replace('-','_')
-        output = os.path.join(out_dir, 'lib%s%s.rlib' % (output_name, extra_filename))
+        # XXX proc-macro crate-type is (undocumented; unstable interface) '.so' instead of '.rlib'
+        target_output = os.path.join(target_out_dir, 'lib%s%s.rlib' % (output_name, extra_filename))
 
         if str(self) in BUILT:
-            return ({'name':self.name(), 'lib':output}, self._env, self._extra_flags)
+            print ''
+            dbg('Skipping %s, already built (needed by: %s)' % (str(self), str(by)))
+            return ({'name':self.name(), 'lib':target_output}, self._env, self._extra_flags)
 
         externs = []
         extra_flags = []
         for dep,info in self._deps.iteritems():
-            if dep in CRATES:
-                extern, env, extra_flags = CRATES[dep].build(self, out_dir, info['features'])
+            if not dep in CRATES:
+                continue
+
+            if target != HOST and info['kind'] in ('all', 'build'):
+                # Ensure build dependencies are built for host first.
+                CRATES[dep].build(self, host_out_dir, HOST, host_out_dir, info['features'])
+
+                # ensure host build doesn't satisfy target build dependencies
+                del BUILT[dep]
+
+            if target == HOST or info['kind'] in ('all', 'normal'):
+                # If not a build-only dependency, build for target.
+                print "building %s for target %s -> %s" % (dep, target, target_out_dir)
+                extern, env, extra_flags = CRATES[dep].build(self, host_out_dir, target, target_out_dir, info['features'])
+
                 externs.append(extern)
                 self._dep_env[CRATES[dep].name()] = env
                 self._extra_flags += extra_flags
 
-        if os.path.isfile(output):
+        if os.path.isfile(target_output):
             print ''
             dbg('Skipping %s, already built (needed by: %s)' % (str(self), str(by)))
             BUILT[str(self)] = str(by)
-            return ({'name':self.name(), 'lib':output}, self._env, self._extra_flags)
+            return ({'name':self.name(), 'lib':target_output}, self._env, self._extra_flags)
 
         # build the environment for subcommands
         tenv = dict(os.environ)
         env = {}
+
+        # setup compiler environment, accounting for cross-compiles
+        cc = tenv.get('CC')
+        cxx = tenv.get('CXX')
+        ld = tenv.get('LD')
+        ar = tenv.get('AR')
+        cross = tenv.get('CROSS_COMPILE')
+        pcsysroot = tenv.get('PKG_CONFIG_SYSROOT_DIR')
+        if cross and target != HOST:
+            env['CROSS_COMPILE'] = cross
+            if cc:
+                cc = ''.join((cross, cc))
+            if cxx:
+                cxx = ''.join((cross, cxx))
+            if ld:
+                ld = ''.join((cross, ld))
+            if pcsysroot:
+                env['PKG_CONFIG_SYSROOT_DIR'] = pcsysroot
+                env['PKG_CONFIG_LIBDIR'] = ':'.join((
+                  os.path.join(pcsysroot, 'usr', 'lib', '64', 'pkgconfig'),
+                  os.path.join(pcsysroot, 'usr', 'share', 'pkgconfig')))
+                env['PKG_CONFIG_ALLOW_CROSS'] = '1'
+
+        if cc:
+            env['CC'] = cc
+        if cxx:
+            env['CXX'] = cxx
+
         env['PATH'] = tenv['PATH']
-        env['OUT_DIR'] = out_dir
-        env['TARGET'] = TARGET
+        env['OUT_DIR'] = target_out_dir
+        env['TARGET'] = target
         env['HOST'] = HOST
         env['NUM_JOBS'] = '1'
         env['OPT_LEVEL'] = '0'
@@ -929,18 +984,26 @@ class Crate(object):
                     v = str(v)
                 env['DEP_%s_%s' % (l.upper(), v.upper())] = v
 
-        # create the builders, build scrips are first
+        # create the builders, build scripts are first
         cmds = []
         for b in self._build:
+            if b['type'] == 'build_script':
+                out_dir = host_out_dir
+            else:
+                out_dir = target_out_dir
+
             v = str(self._version).replace('.','_')
             cmd = ['rustc']
-            cmd.append(os.path.join(self._dir, b['path']))
+            if b['path'].startswith(self._dir):
+                cmd.append(b['path'])
+            else:
+                cmd.append(os.path.join(self._dir, b['path']))
             cmd.append('--crate-name')
-            if b['type'] == 'lib':
+            if b['type'] == 'lib' or b['type'] == 'proc-macro':
                 b.setdefault('name', self.name())
                 cmd.append(b['name'].replace('-','_'))
                 cmd.append('--crate-type')
-                cmd.append('lib')
+                cmd.append(b['type'])
             elif b['type'] == 'build_script':
                 cmd.append('build_script_%s' % b['name'].replace('-','_'))
                 cmd.append('--crate-type')
@@ -957,11 +1020,26 @@ class Crate(object):
             cmd.append('-C')
             cmd.append('extra-filename=' + extra_filename)
 
+            if ar:
+                cmd.append('-C')
+                cmd.append('ar=' + ar)
+
+            if ld:
+                cmd.append('-C')
+                if b['type'] == 'build_script':
+                    # Always use original LD for build scripts.
+                    cmd.append('linker=' + tenv['LD'])
+                else:
+                    cmd.append('linker=' + ld)
+
             cmd.append('--out-dir')
             cmd.append('%s' % out_dir)
             cmd.append('--emit=dep-info,link')
             cmd.append('--target')
-            cmd.append(TARGET)
+            if b['type'] == 'build_script' and target != HOST:
+                cmd.append(HOST)
+            else:
+                cmd.append(target)
             cmd.append('-L')
             cmd.append('%s' % out_dir)
             cmd.append('-L')
@@ -980,8 +1058,22 @@ class Crate(object):
             if match is not None:
                 match = match.groupdict()['name'].replace('-','_')
 
+            if b['type'] == 'build_script':
+                renv = env.copy()
+                renv.pop('CROSS_COMPILE', None)
+
+                # Always use original CC, CXX for build scripts.
+                scc = tenv.get('CC')
+                scxx = tenv.get('CXX')
+                if scc:
+                    renv['CC'] = scc
+                if scxx:
+                    renv['CXX'] = scxx
+            else:
+                renv = env
+
             # queue up the runner
-            cmds.append({'name':b['name'], 'env_key':match, 'cmd':RustcRunner(cmd, env)})
+            cmds.append({'name':b['name'], 'env_key':match, 'cmd':RustcRunner(cmd, renv)})
 
             # queue up the build script runner
             if b['type'] == 'build_script':
@@ -1014,7 +1106,7 @@ class Crate(object):
             #print ''
 
         BUILT[str(self)] = str(by)
-        return ({'name':self.name(), 'lib':output}, self._env, bcmd)
+        return ({'name':self.name(), 'lib':target_output}, self._env, bcmd)
 
 
 def dl_crate(url, depth=0):
@@ -1142,7 +1234,10 @@ def crate_info_from_toml(cdir):
             if type(libs) is not list:
                 libs = [libs]
             for l in libs:
-                l['type'] = 'lib'
+                if l.get('proc-macro', False):
+                    l['type'] = 'proc-macro'
+                else:
+                    l['type'] = 'lib'
                 l['links'] = lnks
                 if l.get('path', None) is None:
                     l['path'] = [ 'lib.rs' ]
@@ -1187,24 +1282,44 @@ def crate_info_from_toml(cdir):
                 else:
                     b['path'] = found_path
 
-            d = cfg.get('build-dependencies', {})
-            d.update(cfg.get('dependencies', {}))
-            d.update(cfg.get('target', {}).get(TARGET, {}).get('dependencies', {}))
+            bdeps = cfg.get('build-dependencies', {})
+            deps = cfg.get('dependencies', {})
+            tdeps = cfg.get('target', {})
+            deps.update(tdeps.get(TARGET, {}).get('dependencies', {}))
+
+            # Set of dependencies only needed for build host.
+            bodeps = set(bdeps.keys()) - set(deps.keys())
+            # Set of dependencies needed for both build host and target.
+            btdeps = set(deps.keys()) & set(bdeps.keys())
+
+            # Add deps info too bdeps, overwriting already existing entries.
+            bdeps.update(deps)
+            d = bdeps
+
             deps = []
             for k,v in d.iteritems():
+                if k in bodeps:
+                    kind = 'build'
+                elif k in btdeps:
+                    kind = 'all'
+                else:
+                    kind = 'normal'
+
                 if type(v) is not dict:
-                    deps.append({'name':k, 'req': v})
+                    deps.append({'name':k, 'req': v, 'kind': kind})
                 elif 'path' in v:
                     if v.get('version', None) is None:
-                        deps.append({'name':k, 'path':os.path.join(cdir, v['path']), 'local':True, 'req':0})
+                        deps.append({'name':k, 'path':os.path.join(cdir, v['path']), 'local':True, 'req':0, 'kind':kind})
                     else:
                         opts = v.get('optional',False)
+                        local = v.get('local',None)
                         ftrs = v.get('features',[])
-                        deps.append({'name':k, 'path': v['path'], 'req':v['version'], 'features':ftrs, 'optional':opts})
+                        deps.append({'name':k, 'path': v['path'], 'req':v['version'], 'features':ftrs, 'optional':opts, 'local':local, 'kind':kind})
                 else:
                     opts = v.get('optional',False)
                     ftrs = v.get('features',[])
-                    deps.append({'name':k, 'req':v['version'], 'features':ftrs, 'optional':opts})
+                    local = v.get('local',None)
+                    deps.append({'name':k, 'req':v['version'], 'features':ftrs, 'optional':opts, 'local':local, 'kind':kind})
 
             return (name, ver, deps, build)
 
@@ -1441,7 +1556,25 @@ if __name__ == "__main__":
         print '=========================='
         print '===== BUILDING CARGO ====='
         print '=========================='
-        cargo_crate.build('bootstrap.py', args.target_dir)
+
+        target_dir = os.path.join(args.target_dir, TARGET)
+        try:
+            os.makedirs(target_dir)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+        if TARGET != HOST:
+            host_dir = os.path.join(args.target_dir, HOST)
+            try:
+                os.makedirs(os.path.join(args.target_dir, HOST))
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+        else:
+            host_dir = target_dir
+
+        cargo_crate.build('bootstrap.py', host_dir, TARGET, target_dir)
 
         # cleanup
         if not args.no_clean:
