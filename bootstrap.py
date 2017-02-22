@@ -1287,6 +1287,15 @@ def crate_info_from_toml(cdir):
             tdeps = cfg.get('target', {})
             deps.update(tdeps.get(TARGET, {}).get('dependencies', {}))
 
+            # XXX hacky extraction of target-specific dependencies
+            for k in tdeps.keys():
+                if not k.startswith('cfg('):
+                    continue
+                m = re.sub('cfg\((.*)\)$', '\g<1>', k)
+                if m == "unix" or m.startswith("all(unix") or \
+                  m == 'not(target_os = "emscripten")':
+                    deps.update(tdeps.get(k, {}).get('dependencies', {}))
+
             # Set of dependencies only needed for build host.
             bodeps = set(bdeps.keys()) - set(deps.keys())
             # Set of dependencies needed for both build host and target.
